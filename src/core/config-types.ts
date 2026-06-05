@@ -24,6 +24,8 @@ export interface ConfiguredChannel {
 	dm?: boolean;
 	access?: AccessPolicy;
 	gondolin?: GondolinConfig;
+	// Opt-in tools added to this channel's deny-by-default chat allowlist (ADR-0001).
+	extraTools?: string[];
 }
 
 export interface BaseAccountConfig {

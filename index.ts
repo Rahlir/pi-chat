@@ -97,6 +97,14 @@ const WORKER_TMUX_PREFIX = "pi-chat-worker-";
 const DASHBOARD_TMUX_SESSION = "pi-chat-dashboard";
 const WORKER_STATUS_DIR = join(CHAT_HOME, "worker-status");
 
+// pi-chat's model-driven tools. Registered tools are active by default, so these must be
+// stripped from ordinary sessions' context and only re-enabled while connected (ADR-0001).
+const CHAT_TURN_TOOLS = ["chat_history", "chat_attach", "chat_request_secret"];
+
+// Single source of truth for the tools a connected pi-chat turn may use. Both the active-tool
+// set and the tool_call gate derive from this (ADR-0001); never introduce a second list.
+const CHAT_BASE_TOOLS = ["read", "write", "edit", "bash", ...CHAT_TURN_TOOLS];
+
 interface WorkerStatusSnapshot {
 	conversationId: string;
 	conversationName: string;
@@ -475,6 +483,9 @@ export default function (pi: ExtensionAPI) {
 	let warnedHostSkillsLeak = false;
 	let pendingControlAction: (() => Promise<void>) | undefined;
 	let activeTriggerMessageId: string | undefined;
+	// Host session's active tools captured before we entered chat scope, restored on disconnect
+	// so /chat-connect in an interactive session is reversible (ADR-0001).
+	let baseActiveTools: string[] | undefined;
 
 	function persistChatState(conversationId?: string): void {
 		pi.appendEntry<PersistedChatState>(SESSION_STATE_CUSTOM_TYPE, { conversationId });
@@ -809,7 +820,7 @@ export default function (pi: ExtensionAPI) {
 			}
 			if (runtime) await runtime.disconnect().catch(() => undefined);
 			runtime = undefined;
-			updateStatus(ctx, result.error);
+			applyScope(ctx, result.error);
 			if (interactive) await showNotice(ctx, "Connect error", result.error, "error");
 			return false;
 		}
@@ -817,7 +828,7 @@ export default function (pi: ExtensionAPI) {
 		startWorkerStatusLoop(ctx);
 		if (interactive) ctx.ui.notify(`Connected ${conversation.conversationName}`, "info");
 		await showChatContextMessage();
-		updateStatus(ctx);
+		applyScope(ctx);
 		await tryDispatch(ctx);
 		return true;
 	}
@@ -892,6 +903,33 @@ export default function (pi: ExtensionAPI) {
 		workerStatusInterval = undefined;
 	}
 
+	function chatAllowlist(): string[] {
+		const extra = runtime?.conversation.channel.extraTools ?? [];
+		return [...new Set([...CHAT_BASE_TOOLS, ...extra])];
+	}
+
+	// Scope reconciler (ADR-0001). Called on every connection transition; recomputes the two
+	// things that must track connection state: the active tool set and the chat status segment.
+	// Tool activation collapses to connected/not because the turn boundary is enforced separately
+	// by each tool's chatTurnInFlight guard and the tool_call gate.
+	function applyScope(ctx: ExtensionContext, error?: string): void {
+		if (runtime) {
+			if (baseActiveTools === undefined) baseActiveTools = pi.getActiveTools();
+			pi.setActiveTools(chatAllowlist());
+		} else if (baseActiveTools !== undefined) {
+			// Restore the exact host toolset captured before we entered chat scope.
+			pi.setActiveTools(baseActiveTools);
+			baseActiveTools = undefined;
+		} else {
+			// Ordinary session: registered tools are active by default, so drop our turn-only tools
+			// from context without disturbing builtins or other extensions' tools.
+			const active = pi.getActiveTools();
+			const filtered = active.filter((name) => !CHAT_TURN_TOOLS.includes(name));
+			if (filtered.length !== active.length) pi.setActiveTools(filtered);
+		}
+		updateStatus(ctx, error);
+	}
+
 	function updateStatus(ctx: ExtensionContext, error?: string): void {
 		void writeWorkerStatus(ctx, error).catch(() => undefined);
 		const theme = ctx.ui.theme;
@@ -901,7 +939,8 @@ export default function (pi: ExtensionAPI) {
 			return;
 		}
 		if (!runtime) {
-			ctx.ui.setStatus("chat", `${label} ${theme.fg("muted", "disconnected")}`);
+			// Not connected: contribute nothing to an ordinary session's status bar (ADR-0001).
+			ctx.ui.setStatus("chat", undefined);
 			return;
 		}
 		const status = runtime.getStatus();
@@ -927,21 +966,9 @@ export default function (pi: ExtensionAPI) {
 		void liveConnection?.stopTyping();
 	}
 
-	pi.registerTool({
-		name: "chat_workers",
-		label: "Chat Workers",
-		description: "Show configured pi-chat worker status from tmux and worker status snapshots.",
-		parameters: Type.Object({}),
-		renderCall(_args, theme) {
-			return new Text(theme.fg("toolTitle", theme.bold("chat_workers")), 0, 0);
-		},
-		async execute() {
-			const config = await loadChatConfig();
-			const configured = listConfiguredConversations(config);
-			const body = configured.length > 0 ? await formatWorkerStatus(configured) : "No configured channels.";
-			return { content: [{ type: "text", text: body }], details: { count: configured.length } };
-		},
-	});
+	// chat_workers is exposed only as the /chat-workers operator command, never as a model-driven
+	// tool: control-plane capabilities are operator-driven and stay out of every session's context
+	// (ADR-0001).
 
 	pi.registerTool({
 		name: "chat_history",
@@ -1138,7 +1165,8 @@ export default function (pi: ExtensionAPI) {
 		sandbox = undefined;
 		if (currentSandbox) await currentSandbox.close().catch(() => undefined);
 		if (!runtime) {
-			updateStatus(ctx);
+			// Nothing was connected, so there is no scope transition to reconcile here. The caller
+			// (e.g. connectConversation) drives the next applyScope on success or failure.
 			return;
 		}
 		const current = runtime;
@@ -1146,18 +1174,16 @@ export default function (pi: ExtensionAPI) {
 		chatTurnInFlight = false;
 		await current.disconnect();
 		if (clearPersistedState) persistChatState(undefined);
-		updateStatus(ctx);
+		applyScope(ctx);
 	}
 
 	pi.on("tool_call", async (event) => {
 		if (!chatTurnInFlight) return;
-		if (
-			["read", "write", "edit", "bash", "chat_attach", "chat_history", "chat_request_secret"].includes(event.toolName)
-		)
-			return;
+		const allowed = chatAllowlist();
+		if (allowed.includes(event.toolName)) return;
 		return {
 			block: true,
-			reason: "pi-chat remote turns only allow read, write, edit, bash, chat_history, and chat_attach",
+			reason: `pi-chat remote turns only allow: ${allowed.join(", ")}`,
 		};
 	});
 
@@ -1301,7 +1327,11 @@ export default function (pi: ExtensionAPI) {
 	pi.registerCommand("chat-new", {
 		description: "Start a new pi session and keep the current pi-chat connection",
 		handler: async (_args, ctx) => {
-			const conversationId = runtime?.conversation.conversationId;
+			if (!runtime) {
+				ctx.ui.notify("No active pi-chat connection.", "warning");
+				return;
+			}
+			const conversationId = runtime.conversation.conversationId;
 			const result = await ctx.newSession({
 				parentSession: ctx.sessionManager.getSessionFile(),
 				setup: async (sm) => {
@@ -1315,6 +1345,10 @@ export default function (pi: ExtensionAPI) {
 	pi.registerCommand("chat-disconnect", {
 		description: "Disconnect the current pi-chat channel",
 		handler: async (_args, ctx) => {
+			if (!runtime) {
+				ctx.ui.notify("No active pi-chat connection.", "warning");
+				return;
+			}
 			await disconnectRuntime(ctx);
 		},
 	});
@@ -1322,6 +1356,10 @@ export default function (pi: ExtensionAPI) {
 	pi.registerCommand("chat-status", {
 		description: "Show pi-chat connection status",
 		handler: async (_args, ctx) => {
+			if (!runtime) {
+				ctx.ui.notify("No active pi-chat connection.", "warning");
+				return;
+			}
 			ctx.ui.notify(buildRemoteStatus(ctx), "info");
 		},
 	});
@@ -1361,17 +1399,7 @@ export default function (pi: ExtensionAPI) {
 				return tool.execute(id, params, signal, onUpdate);
 			},
 		});
-		pi.setActiveTools([
-			"read",
-			"write",
-			"edit",
-			"bash",
-			"chat_history",
-			"chat_attach",
-			"chat_request_secret",
-			"chat_workers",
-		]);
-		updateStatus(ctx);
+		applyScope(ctx);
 		const flaggedConversationId = pi.getFlag(CHAT_CONVERSATION_FLAG);
 		const persistedConversationId = getPersistedConversationId(ctx);
 		const conversationId =
