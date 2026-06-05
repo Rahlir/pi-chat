@@ -246,10 +246,15 @@ function formatChatSkillsForPrompt(skills: ChatPromptSkill[]): string {
 // opener and the "</available_skills>" closing tag (fixed by the Agent Skills spec). The
 // preamble's middle sentences are intentionally not matched, because pi ships more than one
 // skills formatter with diverging wording, so coupling to them would silently break on a pi
-// upgrade. before_agent_start verifies the strip actually happened and warns otherwise.
+// upgrade. The leading \n\n mirrors pi's exact block separator; if pi ever changes it the
+// strip no-ops, which before_agent_start detects and warns about rather than failing quietly.
 const HOST_SKILLS_BLOCK_RE = /\n\nThe following skills[\s\S]*?<\/available_skills>/;
 
 function adaptSystemPromptForSandbox(prompt: string): string {
+	// Note the asymmetry: the cwd rewrite is best-effort (a silent no-op if process.cwd()
+	// doesn't byte-match the embedded path), whereas the skills strip is guarded in
+	// before_agent_start. Both values come from this same Node process, so cwd drift is
+	// effectively impossible in practice.
 	return prompt
 		.replace(
 			`Current working directory: ${process.cwd()}`,
@@ -465,6 +470,8 @@ export default function (pi: ExtensionAPI) {
 	let workerStatusInterval: ReturnType<typeof setInterval> | undefined;
 	let queuedOutboundAttachments: string[] = [];
 	let pendingChatDispatch = false;
+	// Latches true after the first failed host-skills strip so the drift warning fires once per
+	// extension instance; intentionally not reset, since a surviving block always means broken output.
 	let warnedHostSkillsLeak = false;
 	let pendingControlAction: (() => Promise<void>) | undefined;
 	let activeTriggerMessageId: string | undefined;
