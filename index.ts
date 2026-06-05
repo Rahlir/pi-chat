@@ -241,8 +241,13 @@ function formatChatSkillsForPrompt(skills: ChatPromptSkill[]): string {
 // the host's skills directories. In sandbox mode those host paths are unreachable inside
 // the Gondolin VM, so we strip the entire block (preamble + tags) and let pi-chat's own
 // buildSkillsPromptSuffix re-emit a VM-aware block with guest paths.
-const HOST_SKILLS_BLOCK_RE =
-	/\n\nThe following skills provide specialized instructions for specific tasks\.\nUse the read tool to load a skill's file when the task matches its description\.\nWhen a skill file references a relative path[\s\S]*?<\/available_skills>/;
+//
+// We anchor only on the stable parts of pi's output: the "The following skills" preamble
+// opener and the "</available_skills>" closing tag (fixed by the Agent Skills spec). The
+// preamble's middle sentences are intentionally not matched, because pi ships more than one
+// skills formatter with diverging wording, so coupling to them would silently break on a pi
+// upgrade. before_agent_start verifies the strip actually happened and warns otherwise.
+const HOST_SKILLS_BLOCK_RE = /\n\nThe following skills[\s\S]*?<\/available_skills>/;
 
 function adaptSystemPromptForSandbox(prompt: string): string {
 	return prompt
@@ -460,6 +465,7 @@ export default function (pi: ExtensionAPI) {
 	let workerStatusInterval: ReturnType<typeof setInterval> | undefined;
 	let queuedOutboundAttachments: string[] = [];
 	let pendingChatDispatch = false;
+	let warnedHostSkillsLeak = false;
 	let pendingControlAction: (() => Promise<void>) | undefined;
 	let activeTriggerMessageId: string | undefined;
 
@@ -1384,8 +1390,18 @@ export default function (pi: ExtensionAPI) {
 		};
 	});
 
-	pi.on("before_agent_start", async (event) => {
+	pi.on("before_agent_start", async (event, ctx) => {
 		const systemPrompt = sandbox ? adaptSystemPromptForSandbox(event.systemPrompt) : event.systemPrompt;
+		// If pi changes its skills prompt format, the strip above silently no-ops and host paths
+		// leak into the VM. Detect the surviving host block (pi-chat's own block is appended later)
+		// and surface it once instead of failing quietly.
+		if (sandbox && !warnedHostSkillsLeak && systemPrompt.includes("<available_skills>")) {
+			warnedHostSkillsLeak = true;
+			ctx.ui.notify(
+				"pi-chat: could not strip the host skills block from the sandbox system prompt. pi's skills prompt format may have changed; host skill paths may leak into the VM. Update HOST_SKILLS_BLOCK_RE.",
+				"warning",
+			);
+		}
 		if (!pendingChatDispatch) return sandbox ? { systemPrompt } : undefined;
 		pendingChatDispatch = false;
 		const channelName = runtime?.conversation.channel.name ?? runtime?.conversation.channelKey ?? "chat";
