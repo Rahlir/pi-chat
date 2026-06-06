@@ -71,6 +71,9 @@ export class ConversationRuntime {
 	private nextRecordId = 1;
 	private pendingJobs: PendingJob[] = [];
 	private activeJob: PendingJob | undefined;
+	// Record id of the most recent outbound for the active job. Per-turn sending writes many
+	// outbounds, so the closing job_completed points at this last one rather than a single send.
+	private lastOutboundRecordId: number | undefined;
 	private armedAfterRecordId: number | undefined;
 
 	constructor(conversation: ResolvedConversation, ownerId: string) {
@@ -241,6 +244,7 @@ export class ConversationRuntime {
 		const job = this.pendingJobs.shift();
 		if (!job) return undefined;
 		this.activeJob = job;
+		this.lastOutboundRecordId = undefined;
 		const triggerRecord = getLatestTriggerRecord(this.records, job);
 		return { job, prompt: this.buildPrompt(job), triggerMessageId: triggerRecord?.messageId };
 	}
@@ -256,33 +260,49 @@ export class ConversationRuntime {
 		return lines.join("\n").trim();
 	}
 
-	async completeActiveJob(text: string, remoteMessageId?: string, attachmentPaths?: string[]): Promise<void> {
+	// Append one outbound record for a message already delivered to the chat service. Per-turn
+	// sending calls this once per delivered turn; the closing attachment flush calls it once more.
+	// Returns the new record id (undefined when there is nothing to log) and tracks it so the
+	// terminal job_completed can reference the last delivered message. replyToMessageId is supplied
+	// by the caller to mirror what was actually threaded (only the first message replies to the trigger).
+	async recordOutbound(
+		text: string,
+		remoteMessageId?: string,
+		replyToMessageId?: string,
+		attachmentPaths?: string[],
+	): Promise<number | undefined> {
+		const job = this.activeJob;
+		if (!job) return undefined;
+		const trimmed = text.trim();
+		if (trimmed.length === 0 && (attachmentPaths?.length ?? 0) === 0) return undefined;
+		const outbound = {
+			type: "outbound",
+			...buildBaseRecordFields(this.conversation, this.nextRecordId),
+			messageId: remoteMessageId || nextMessageId(this.conversation.service),
+			text: trimmed,
+			replyToMessageId,
+			jobId: job.jobId,
+			attachments: attachmentPaths?.length ? [...attachmentPaths] : undefined,
+		} as const;
+		this.lastOutboundRecordId = outbound.recordId;
+		await this.appendRecord(outbound);
+		return outbound.recordId;
+	}
+
+	// Close out the active job. Outbound records are written incrementally via recordOutbound during
+	// the turn, so this only advances the consumption boundary by appending job_completed.
+	async completeActiveJob(): Promise<void> {
 		const job = this.activeJob;
 		if (!job) return;
-		let outboundRecordId: number | undefined;
-		const trimmed = text.trim();
-		if (trimmed.length > 0 || (attachmentPaths?.length ?? 0) > 0) {
-			const triggerRecord = getLatestTriggerRecord(this.records, job);
-			const outbound = {
-				type: "outbound",
-				...buildBaseRecordFields(this.conversation, this.nextRecordId),
-				messageId: remoteMessageId || nextMessageId(this.conversation.service),
-				text: trimmed,
-				replyToMessageId: triggerRecord?.messageId,
-				jobId: job.jobId,
-				attachments: attachmentPaths?.length ? [...attachmentPaths] : undefined,
-			} as const;
-			outboundRecordId = outbound.recordId;
-			await this.appendRecord(outbound);
-		}
 		await this.appendRecord({
 			type: "job_completed",
 			...buildBaseRecordFields(this.conversation, this.nextRecordId),
 			jobId: job.jobId,
 			triggerRecordId: job.triggerRecordId,
-			outboundRecordId,
+			outboundRecordId: this.lastOutboundRecordId,
 		});
 		this.activeJob = undefined;
+		this.lastOutboundRecordId = undefined;
 	}
 
 	async failActiveJob(error: string): Promise<void> {
@@ -296,6 +316,7 @@ export class ConversationRuntime {
 			error,
 		});
 		this.activeJob = undefined;
+		this.lastOutboundRecordId = undefined;
 	}
 
 	async appendError(message: string): Promise<void> {

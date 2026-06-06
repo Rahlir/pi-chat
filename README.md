@@ -21,6 +21,10 @@ So far, these are the changes from the upstream version:
   failures due to mismatched tokens. Side benefit is that the Telegram HTML has more features than the previous Markdown
   rendering (proper lists, proper italic and bold emphasis, tables are rendered in code blocks and reformatted on
   best-effort basis to look like tables).
+* Agent now sends all "visible" messages to the chat. Thinking and tool calls are ignored on purpose, only "visible
+  messages" are sent to the chat.
+	* Previously, only the last message was sent to the chat. This is often insufficient as the final message often
+	  refers to things said in a previous "in-progress" message.
 
 ## Quick Start
 

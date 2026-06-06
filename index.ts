@@ -18,6 +18,7 @@ import {
 } from "@mariozechner/pi-coding-agent";
 import { Box, Text } from "@mariozechner/pi-tui";
 import { Type } from "@sinclair/typebox";
+import { extractAssistantRunMetadata, extractAssistantText, sumAssistantUsage } from "./src/agent-output.js";
 import {
 	CHAT_CONFIG_PATH,
 	CHAT_HOME,
@@ -26,7 +27,6 @@ import {
 	loadChatConfig,
 	resolveConversation,
 } from "./src/config.js";
-
 import type { ResolvedConversation } from "./src/core/config-types.js";
 import { ConversationSandbox, GONDOLIN_SHARED, GONDOLIN_WORKSPACE } from "./src/gondolin.js";
 import { connectLive } from "./src/live/index.js";
@@ -80,12 +80,6 @@ Use chat_history to look up older messages when needed.
 
 Your response is sent as the bot's reply to the remote chat.`;
 }
-
-type AssistantSummary = {
-	text?: string;
-	stopReason?: string;
-	errorMessage?: string;
-};
 
 type PersistedChatState = {
 	conversationId?: string;
@@ -439,29 +433,6 @@ function formatTokens(count: number): string {
 	return `${Math.round(count / 1000000)}M`;
 }
 
-function extractAssistantSummary(messages: unknown[]): AssistantSummary {
-	for (let index = messages.length - 1; index >= 0; index--) {
-		const message = messages[index];
-		if (!message || typeof message !== "object") continue;
-		const value = message as Record<string, unknown>;
-		if (value.role !== "assistant") continue;
-		const stopReason = typeof value.stopReason === "string" ? value.stopReason : undefined;
-		const errorMessage = typeof value.errorMessage === "string" ? value.errorMessage : undefined;
-		const content = Array.isArray(value.content) ? value.content : [];
-		const text = content
-			.filter(
-				(block): block is { type: string; text?: string } =>
-					typeof block === "object" && block !== null && "type" in block,
-			)
-			.filter((block) => block.type === "text" && typeof block.text === "string")
-			.map((block) => block.text as string)
-			.join("")
-			.trim();
-		return { text: text || undefined, stopReason, errorMessage };
-	}
-	return {};
-}
-
 export default function (pi: ExtensionAPI) {
 	pi.registerFlag(CHAT_CONVERSATION_FLAG, {
 		description: "Auto-connect pi-chat to a configured account/channel",
@@ -477,6 +448,13 @@ export default function (pi: ExtensionAPI) {
 	let typingInterval: ReturnType<typeof setInterval> | undefined;
 	let workerStatusInterval: ReturnType<typeof setInterval> | undefined;
 	let queuedOutboundAttachments: string[] = [];
+	// Per-turn sending delivers many messages per job; only the first threads to the trigger. Reset
+	// at dispatch and latched after the first successful send.
+	let firstChatMessageSent = false;
+	// True when the most recently sent assistant text failed to deliver. At agent_end this stands in
+	// for "the final reply never landed", so the job is failed (boundary unmoved) instead of completed,
+	// letting the next inbound re-run the slice rather than silently dropping the answer.
+	let lastTextSendFailed = false;
 	let pendingChatDispatch = false;
 	// Latches true after the first failed host-skills strip so the drift warning fires once per
 	// extension instance; intentionally not reset, since a surviving block always means broken output.
@@ -619,38 +597,19 @@ export default function (pi: ExtensionAPI) {
 	}
 
 	function buildRemoteStatus(ctx: ExtensionContext): string {
-		let totalInput = 0;
-		let totalOutput = 0;
-		let totalCacheRead = 0;
-		let totalCacheWrite = 0;
-		let totalCost = 0;
-		for (const entry of ctx.sessionManager.getEntries()) {
-			const value = entry as {
-				type?: string;
-				message?: {
-					role?: string;
-					usage?: { input: number; output: number; cacheRead: number; cacheWrite: number; cost?: { total: number } };
-				};
-			};
-			if (value.type !== "message" || value.message?.role !== "assistant" || !value.message.usage) continue;
-			totalInput += value.message.usage.input;
-			totalOutput += value.message.usage.output;
-			totalCacheRead += value.message.usage.cacheRead;
-			totalCacheWrite += value.message.usage.cacheWrite;
-			totalCost += value.message.usage.cost?.total ?? 0;
-		}
+		const totals = sumAssistantUsage(ctx.sessionManager.getEntries());
 		const lines: string[] = [];
 		if (ctx.model) lines.push(`Model: ${ctx.model.provider}/${ctx.model.id}`);
 		lines.push(`Thinking: ${pi.getThinkingLevel()}`);
 		const tokenParts: string[] = [];
-		if (totalInput) tokenParts.push(`↑${formatTokens(totalInput)}`);
-		if (totalOutput) tokenParts.push(`↓${formatTokens(totalOutput)}`);
-		if (totalCacheRead) tokenParts.push(`R${formatTokens(totalCacheRead)}`);
-		if (totalCacheWrite) tokenParts.push(`W${formatTokens(totalCacheWrite)}`);
+		if (totals.input) tokenParts.push(`↑${formatTokens(totals.input)}`);
+		if (totals.output) tokenParts.push(`↓${formatTokens(totals.output)}`);
+		if (totals.cacheRead) tokenParts.push(`R${formatTokens(totals.cacheRead)}`);
+		if (totals.cacheWrite) tokenParts.push(`W${formatTokens(totals.cacheWrite)}`);
 		if (tokenParts.length > 0) lines.push(`Usage: ${tokenParts.join(" ")}`);
 		const usingSubscription = ctx.model ? ctx.modelRegistry.isUsingOAuth(ctx.model) : false;
-		if (totalCost || usingSubscription)
-			lines.push(`Cost: $${totalCost.toFixed(3)}${usingSubscription ? " (sub)" : ""}`);
+		if (totals.cost || usingSubscription)
+			lines.push(`Cost: $${totals.cost.toFixed(3)}${usingSubscription ? " (sub)" : ""}`);
 		const usage = ctx.getContextUsage();
 		if (usage) {
 			const contextWindow = usage.contextWindow ?? ctx.model?.contextWindow ?? 0;
@@ -966,6 +925,57 @@ export default function (pi: ExtensionAPI) {
 		void liveConnection?.stopTyping();
 	}
 
+	// Deliver one chat message under the same timeout/abort guard the turn loop relies on, retrying a
+	// few times on transient failures so a flaky network does not silently drop a reply. Threads only
+	// the first successfully delivered message to the trigger. Callers persist the outbound; this just
+	// performs the send and reports the ids actually used. Aborts are never retried.
+	async function sendChatMessage(
+		ctx: ExtensionContext,
+		text: string,
+		attachmentPaths: string[],
+	): Promise<
+		{ ok: true; remoteMessageId?: string; replyToMessageId?: string } | { ok: false; aborted: boolean; message: string }
+	> {
+		// Callers gate on liveConnection before calling, so this is a defensive guard. Report failure
+		// rather than a phantom success so any future caller that reaches it does not record an outbound
+		// for a message that was never sent.
+		if (!liveConnection) return { ok: false, aborted: false, message: "no live connection" };
+		const replyToMessageId = firstChatMessageSent ? undefined : activeTriggerMessageId;
+		const backoffsMs = [500, 1500];
+		let lastMessage = "send failed";
+		for (let attempt = 0; attempt <= backoffsMs.length; attempt++) {
+			let timeoutHandle: ReturnType<typeof setTimeout> | undefined;
+			try {
+				const remoteMessageId = await Promise.race([
+					liveConnection.send(text, attachmentPaths, ctx.signal, replyToMessageId),
+					new Promise<string>((_, reject) => {
+						timeoutHandle = setTimeout(() => reject(new Error("send timed out")), 120000);
+					}),
+					waitForAbort(ctx.signal),
+				]);
+				firstChatMessageSent = true;
+				return { ok: true, remoteMessageId, replyToMessageId };
+			} catch (error) {
+				if (error instanceof Error && error.name === "AbortError") {
+					return { ok: false, aborted: true, message: error.message };
+				}
+				lastMessage = error instanceof Error ? error.message : String(error);
+				if (attempt >= backoffsMs.length) break;
+				try {
+					await Promise.race([
+						new Promise<void>((resolve) => setTimeout(resolve, backoffsMs[attempt])),
+						waitForAbort(ctx.signal),
+					]);
+				} catch {
+					return { ok: false, aborted: true, message: lastMessage };
+				}
+			} finally {
+				if (timeoutHandle) clearTimeout(timeoutHandle);
+			}
+		}
+		return { ok: false, aborted: false, message: lastMessage };
+	}
+
 	// chat_workers is exposed only as the /chat-workers operator command, never as a model-driven
 	// tool: control-plane capabilities are operator-driven and stay out of every session's context
 	// (ADR-0001).
@@ -1139,6 +1149,8 @@ export default function (pi: ExtensionAPI) {
 			chatTurnInFlight = true;
 			activeTriggerMessageId = next.triggerMessageId;
 			queuedOutboundAttachments = [];
+			firstChatMessageSent = false;
+			lastTextSendFailed = false;
 			pendingChatDispatch = true;
 			liveConnection?.setReplyTo(activeTriggerMessageId);
 			startTypingLoop();
@@ -1455,14 +1467,43 @@ export default function (pi: ExtensionAPI) {
 		};
 	});
 
+	// Deliver each turn's visible text as it completes so the chat sees in-progress replies rather than
+	// only the final message. Ordering vs agent_end is guaranteed by the framework: AgentSession
+	// serializes event processing on a single promise queue and awaits each extension handler
+	// (extensions/runner.ts emit awaits handler(event)), so this turn_end handler, including its awaited
+	// send, fully settles before the agent_end handler runs. That is what lets a lastTextSendFailed set
+	// here be observed by agent_end. Thinking and tool-call blocks are dropped by extractAssistantText.
+	pi.on("turn_end", async (event, ctx) => {
+		if (!runtime || !chatTurnInFlight || !liveConnection) return;
+		if (event.message.role !== "assistant") return;
+		const text = extractAssistantText(event.message);
+		if (!text) return;
+		// NOTE: This does back-presure the agent loop on chat latency. Not a huge deal, but if performance
+		// becomes an issue, we need to implement a proper ordered queue of async send calls.
+		const result = await sendChatMessage(ctx, text, []);
+		if (!result.ok) {
+			// Aborts are finalized by agent_end's abort branch. Non-abort failures are recorded so agent_end
+			// can keep the trigger unconsumed when this was the final reply, and skipped so one dropped
+			// intermediate message does not abort the rest of the run.
+			if (!result.aborted) {
+				lastTextSendFailed = true;
+				ctx.ui.notify(`pi-chat send failed: ${result.message}`, "error");
+			}
+			return;
+		}
+		lastTextSendFailed = false;
+		await runtime.recordOutbound(text, result.remoteMessageId, result.replyToMessageId);
+	});
+
 	pi.on("agent_end", async (event, ctx) => {
 		if (!runtime || !chatTurnInFlight) {
 			stopTypingLoop();
 			updateStatus(ctx);
 			return;
 		}
-		const summary = extractAssistantSummary(event.messages as unknown[]);
-		if (summary.stopReason === "aborted") {
+		// Per-turn text is delivered by turn_end; agent_end only needs how the run ended to branch.
+		const outcome = extractAssistantRunMetadata(event.messages);
+		if (outcome.stopReason === "aborted") {
 			stopTypingLoop();
 			chatTurnInFlight = false;
 			await runtime.failActiveJob("aborted");
@@ -1477,10 +1518,10 @@ export default function (pi: ExtensionAPI) {
 			await tryDispatch(ctx);
 			return;
 		}
-		if (summary.stopReason === "error" || summary.stopReason === "length") {
+		if (outcome.stopReason === "error" || outcome.stopReason === "length") {
 			stopTypingLoop();
 			chatTurnInFlight = false;
-			const errorMessage = summary.errorMessage || `agent ${summary.stopReason}`;
+			const errorMessage = outcome.errorMessage || `agent ${outcome.stopReason}`;
 			await runtime.failActiveJob(errorMessage);
 			if (liveConnection) {
 				try {
@@ -1495,34 +1536,55 @@ export default function (pi: ExtensionAPI) {
 			return;
 		}
 		stopTypingLoop();
-		let remoteMessageId: string | undefined;
+		// Per-turn text was already delivered by turn_end. Only staged attachments remain to flush, as a
+		// closing message (threaded only when no text was sent this job).
 		const attachmentPaths = [...queuedOutboundAttachments];
 		queuedOutboundAttachments = [];
-		const finalText = summary.text || (attachmentPaths.length > 0 ? "Attached requested file(s)." : "");
-		if (liveConnection && finalText) {
-			try {
-				remoteMessageId = await Promise.race([
-					liveConnection.send(finalText, attachmentPaths, ctx.signal, activeTriggerMessageId),
-					new Promise<string>((_, reject) => setTimeout(() => reject(new Error("send timed out")), 120000)),
-					waitForAbort(ctx.signal),
-				]);
-			} catch (error) {
-				const message = error instanceof Error ? error.message : String(error);
+		const attachmentCaption = "Attached requested file(s).";
+		let attachmentSendFailed = false;
+		// Skip the attachment send when the final text reply already failed: the job is failed and re-run
+		// below, which re-delivers text and attachment together. Sending now would post an orphan
+		// attachment with no answer and duplicate it on the re-run.
+		if (liveConnection && attachmentPaths.length > 0 && !lastTextSendFailed) {
+			const result = await sendChatMessage(ctx, attachmentCaption, attachmentPaths);
+			if (!result.ok && result.aborted) {
 				chatTurnInFlight = false;
-				if (error instanceof Error && error.name === "AbortError") {
-					await runtime.failActiveJob("aborted");
-					updateStatus(ctx);
-					await tryDispatch(ctx);
-					return;
-				}
-				await runtime.failActiveJob(`send failed: ${message}`);
-				updateStatus(ctx, message);
+				await runtime.failActiveJob("aborted");
+				updateStatus(ctx);
 				await tryDispatch(ctx);
 				return;
 			}
+			if (!result.ok) {
+				// When text already landed via turn_end the core answer reached the user, so a lost attachment
+				// send is tolerated (re-running would duplicate the delivered text). When no text was sent this
+				// job the attachment was the only payload, so losing it means the user received nothing; the
+				// gate below fails that case via !firstChatMessageSent so the slice re-runs.
+				attachmentSendFailed = true;
+				ctx.ui.notify(`pi-chat attachment send failed: ${result.message}`, "error");
+			} else {
+				await runtime.recordOutbound(
+					attachmentCaption,
+					result.remoteMessageId,
+					result.replyToMessageId,
+					attachmentPaths,
+				);
+			}
 		}
 		chatTurnInFlight = false;
-		await runtime.completeActiveJob(finalText, remoteMessageId, attachmentPaths);
+		// Fail (and so keep the trigger unconsumed) when the user received nothing usable: either the final
+		// text reply failed to send, or the job's only payload was an attachment whose send failed.
+		// failActiveJob leaves the consumption boundary unmoved, so the next inbound re-runs the slice and
+		// the answer gets another chance instead of being silently dropped. That re-run replays every text
+		// turn, so a user who already saw intermediate updates may see them again; this duplication is the
+		// accepted cost of never dropping the final answer, and sendChatMessage's retries make it rare.
+		// firstChatMessageSent is true once any send succeeded, so attachment loss after text already
+		// landed does not force a re-run.
+		if (lastTextSendFailed || (attachmentSendFailed && !firstChatMessageSent)) {
+			await runtime.failActiveJob("reply delivery failed");
+			ctx.ui.notify("pi-chat: reply could not be delivered; it will be retried on the next message", "warning");
+		} else {
+			await runtime.completeActiveJob();
+		}
 		updateStatus(ctx);
 		await tryDispatch(ctx);
 	});
