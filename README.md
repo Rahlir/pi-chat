@@ -1,6 +1,26 @@
 # pi-chat
 
-A pi extension that bridges Discord and Telegram channels to a sandboxed pi session. Each connected channel gets its own [Gondolin](https://github.com/earendil-works/gondolin) micro-VM with persistent workspace, shared storage, memory, and skills.
+A pi extension that bridges Discord and Telegram channels to a sandboxed pi session. Each connected channel gets its own
+[Gondolin](https://github.com/earendil-works/gondolin) micro-VM with persistent workspace, shared storage, memory, and
+skills.
+
+## This is a fork!
+
+It seems like Mario's initial great work on `pi-chat` was really just an experiment and the project has probably been
+abandoned now. That's a shame, despite Mario calling it _"a pure AI slob"_, the architecture seems solid and I like the
+philosophy behind it. I saw it as "`pi` among bloated AI chats (`openclaw`, `hermes`, etc.)". And I started relying on
+it.
+
+So, I decided to fork it. No guarantees on how long I will stick with this, but as of now I am actively using `pi-chat`
+actively. This means the plan is to keep fixing it and improving it.
+
+So far, these are the changes from the upstream version:
+* Fixed upstream issue #13 - system prompts now contains only skills reachable by the agent
+* Fixed upstream issue #11 - the extension no longer overrides all your tools when running normal `pi` sessions
+* Fixed upstream issue #10 - the extension now renders Telegram HTML instead of deprecated Markdown which caused silent
+  failures due to mismatched tokens. Side benefit is that the Telegram HTML has more features than the previous Markdown
+  rendering (proper lists, proper italic and bold emphasis, tables are rendered in code blocks and reformatted on
+  best-effort basis to look like tables).
 
 ## Quick Start
 
