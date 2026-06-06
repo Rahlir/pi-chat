@@ -1,8 +1,7 @@
 import type { ResolvedConversation, TelegramAccountConfig } from "../core/config-types.js";
 import type { InboundMessageInput } from "../core/runtime-types.js";
-import { chunkText } from "../render/chunking.js";
-import { formatMarkdownForService, maxMessageLength } from "../render/format.js";
 import { StreamingPreview } from "../render/streaming.js";
+import { htmlToPlainText, renderTelegramHtmlCaption, renderTelegramHtmlChunks } from "../render/telegram-html.js";
 import {
 	fetchBinary,
 	guessAttachmentKind,
@@ -117,13 +116,19 @@ async function sendTelegramChunk(params: {
 	} catch (error) {
 		const message = error instanceof Error ? error.message : String(error);
 		if (!params.parseMode || !PARSE_ERROR.test(message)) throw error;
-		const result = await callTelegram<{ message_id: number }>(
-			params.botToken,
-			"sendMessage",
-			{ ...base, text: params.plainText ?? params.text },
-			{ signal: params.signal },
-		);
-		return String(result.message_id);
+		try {
+			const result = await callTelegram<{ message_id: number }>(
+				params.botToken,
+				"sendMessage",
+				{ ...base, text: params.plainText ?? params.text },
+				{ signal: params.signal },
+			);
+			return String(result.message_id);
+		} catch (fallbackError) {
+			// Keep the original parse error (it carries Telegram's byte-offset
+			// diagnostics) when the plain-text retry also fails.
+			throw new Error(`plain-text fallback failed after parse error: ${message}`, { cause: fallbackError });
+		}
 	}
 }
 
@@ -385,16 +390,16 @@ export async function connectTelegramLive(
 				).message_id,
 			),
 		send: async (text, attachmentPaths = [], signal, replyToMessageId) => {
-			const rendered = formatMarkdownForService("telegram", text);
 			if (attachmentPaths.length === 0) {
-				const chunks = chunkText(rendered.text, maxMessageLength("telegram"));
+				const chunks = renderTelegramHtmlChunks(text);
 				let firstId: string | undefined;
 				for (let i = 0; i < chunks.length; i++) {
 					const id = await sendTelegramChunk({
 						botToken: account.botToken,
 						chatId: Number(conversation.channel.id),
 						text: chunks[i],
-						parseMode: rendered.parseMode,
+						parseMode: "HTML",
+						plainText: htmlToPlainText(chunks[i]),
 						replyToMessageId: i === 0 && replyToMessageId ? Number(replyToMessageId) : undefined,
 						signal,
 					});
@@ -407,19 +412,25 @@ export async function connectTelegramLive(
 			const firstKind = guessAttachmentKind(first.name, first.mimeType);
 			const firstMethod = firstKind === "image" ? "sendPhoto" : "sendDocument";
 			const firstField = firstKind === "image" ? "photo" : "document";
+			const caption = text ? renderTelegramHtmlCaption(text) : undefined;
 			const firstForm = new FormData();
 			firstForm.set("chat_id", String(Number(conversation.channel.id)));
 			if (replyToMessageId) firstForm.set("reply_to_message_id", String(Number(replyToMessageId)));
-			if (text) firstForm.set("caption", text);
-			if (text && firstKind === "image") firstForm.set("parse_mode", "Markdown");
+			if (caption) {
+				firstForm.set("caption", caption.text);
+				if (caption.parseMode) firstForm.set("parse_mode", caption.parseMode);
+			}
 			firstForm.set(firstField, new Blob([Buffer.from(first.data)], { type: first.mimeType }), first.name);
 			let firstData: { message_id: number };
 			try {
 				firstData = await sendTelegramMedia(account.botToken, firstMethod, firstForm, signal);
 			} catch (error) {
 				const message = error instanceof Error ? error.message : String(error);
+				// Only reached when parse_mode was set (HTML caption), so caption.text
+				// is HTML here and htmlToPlainText meaningfully strips it.
 				if (!firstForm.has("parse_mode") || !PARSE_ERROR.test(message)) throw error;
 				firstForm.delete("parse_mode");
+				if (caption) firstForm.set("caption", htmlToPlainText(caption.text));
 				firstData = await sendTelegramMedia(account.botToken, firstMethod, firstForm, signal);
 			}
 			for (const path of rest) {

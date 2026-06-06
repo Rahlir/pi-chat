@@ -6,9 +6,10 @@
 		"strict": true,
 		"noEmit": true,
 		"skipLibCheck": true,
+		"allowImportingTsExtensions": true,
 		"allowSyntheticDefaultImports": true,
 		"esModuleInterop": true,
 		"types": ["node"]
 	},
-	"include": ["index.ts", "types.ts", "src/**/*.ts", "types/**/*.d.ts"]
+	"include": ["index.ts", "types.ts", "src/**/*.ts", "test/**/*.ts", "types/**/*.d.ts"]
 }
